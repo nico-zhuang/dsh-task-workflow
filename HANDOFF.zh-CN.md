@@ -8,6 +8,30 @@
 
 集成目标为 DSH 0.2.2-rc.3 / Cordis 4.1.0。插件同名版本号不是兼容性证明，当前 manifest 只声明 Cordis peer，客户端接口仍为本地类型声明。先查实际 DSH release、Node、Cordis、ModuleLoader、slots、locale、sidebar 与 plugin manager 版本和接口；不要擅自升级 runtime，不混用 alpha/rc，不绕过兼容性检查。此前正式 runtime 未在顶层找到 dsh-client-ui-slots；需要检查其真实解析/客户端依赖发布方式，不能据此直接判定缺包或盲目安装。
 
+## 硬性版本门禁（先于安装，覆盖后续一般流程）
+
+分别记录 hostVersion、profile 的声明版本/实际解析版本、pluginName、pluginVersion、pluginSource，不得混写。profile 未声明版本时明确记为未声明，不得拿插件版本代替。
+
+本次安装目标严格为 package=`dsh-task-workflow`、version=`0.2.2-rc.3`、source=本地 tarball。安装前读取 tarball 内 package.json 并记录 SHA-256；禁止 registry 同名包、latest、npm alias 或跳过名称校验。当前仓库实际 manifest.name 为 `@deepseek-ai/dsh-task-workflow`，与要求不符：这是已知阻断，必须报告并等待用户确认命名修复，不得自动安装、静默改名或视为等价。
+
+官方 installBundle 或等价入口必须传入 `expected: { name: "dsh-task-workflow", version: "0.2.2-rc.3" }`。若当前入口不支持 expected 或同等强制检查，停止并报告，不允许省略。安装前确认 dsh.bundle.patch 指向包内真实、可解析的 patch；缺失立即停止，禁止手动往 profile 插入条目绕过。
+
+安装后交叉核对隔离 profile/package.json 的依赖名称与 tarball 来源、pnpm-lock.yaml 的 importer/解析记录、node_modules 实际 realpath 及 installed package.json 的 name/version。所有实际名称必须为 dsh-task-workflow，版本必须为 0.2.2-rc.3；逐项记录证据和通过/失败，任何不一致均判失败。记录 dsh.profile.bundles 在安装前、安装后、启用前、启用后、停用后和重新启用后的完整非敏感列表；必须包含目标 bundle 的精确名称。
+
+Host 若为 rc.5 或其他版本，不自动升级、降级或替换。只记录真实版本，根据 engines.dsh、peerDependencies、官方兼容检查和实际隔离安装结果判断。缺少 engines.dsh 不等于已确认兼容；没有发现 peer 冲突也不等于运行验收通过。
+
+## 客户端与持久化门禁
+
+安装前必须确认 dsh.client.platform 严格为 web，./client 导出实际指向构建产物且 lib/client.js 存在。盘点 dsh.client.external：未声明则记录 absent，不自行添加；已声明则逐项核对模块精确标识、当前客户端可用版本和解析证据，只允许引用实际可用的模块，不允许通配符或猜测替代。分别记录 external 与 inject，不将两者混为一谈。
+
+安装后必须证明隔离 Host 能通过实际 /plugins 路由提供对应 client bundle，记录脱敏 URL 路径、HTTP 状态、响应内容类型/大小/哈希；浏览器端必须实际加载并注册插件行和面板。依赖存在、配置有记录、HTTP 200 或 fixture 通过，都不能单独代表客户端加载成功。不得记录认证 header 或带凭证 URL。
+
+保留安装后的 profile/package.json、pnpm-lock.yaml、installed manifest 和 dsh.profile.bundles 的脱敏验收摘要及哈希。原始文件如含凭证不得复制或输出，只抽取允许的依赖/版本/组合字段。
+
+在同一个隔离实例中只执行一次重新打开/重新加载页面，并由官方只读组合检查从持久化 profile 重新解析 bundle 选择，证明面板仍存在、bundle 仍选中、client row 仍加载。不启动第二个 Electron，不重复启动正式 Host，不为此重启生产进程。该结果只能标为页面重开及磁盘重解析通过，不能宣称完成冷启动验收；若必须冷启动才可证实，报告未验证并停止，不突破启动限制。
+
+若 bundle 依赖存在但 dsh.profile.bundles 丢失，或重开后 bundle 不再组合、面板/client row 消失，判安装失败，立即停止汇总，不自行补回或修复。全部门禁通过后才允许进入后续优化。
+
 ## 已授权自动执行的流程
 
 1. 在独立工作目录检出此仓库，记录 commit。只检查版本、依赖、manifest、入口、客户端注入与打包文件。使用仓库公开的正常依赖安装流程，设置有界超时；不要读取 .env、凭证或生产配置。

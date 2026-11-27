@@ -54,3 +54,7 @@ This repository contains only the mock task-workflow plugin, local fixtures and 
 ## Continue in DSH
 
 Use [the Chinese handoff prompt](HANDOFF.zh-CN.md) for version checks, isolated installation and lifecycle acceptance before further mock-only improvements.
+
+## Blocking identity gate
+
+The handoff installation target is strictly `dsh-task-workflow@0.2.2-rc.3` from a local tarball. This repository currently declares `@deepseek-ai/dsh-task-workflow`, so that gate fails before installation. Do not treat the names as equivalent or omit the installer's expected-name check. Report the mismatch for user confirmation before changing identity or installing. See HANDOFF.zh-CN.md for client delivery and persistence gates.
