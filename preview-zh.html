@@ -1,0 +1,681 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workbench · 任务工作流</title><style>body{margin:0}#preview-tools{padding:8px;font:13px system-ui;display:flex;gap:8px;align-items:center}</style><body><div id="preview-tools"><span>Mock preview only</span><select id="preview-locale" aria-label="Language"><option value="zh" selected>中文</option><option value="en">English</option></select><select id="preview-theme" aria-label="Theme"><option value="light">Light / 浅色</option><option value="dark">Dark / 深色</option></select></div><div id="app"></div><script>(function() {
+	//#region src/model.ts
+	const adapter = {
+		mode: "mock",
+		invoke: (value, instruction) => `[mock] ${instruction}: ${value}`
+	};
+	const DRAFT_KEY = "dsh.task-workflow.mock.v1";
+	const nodeKinds = [
+		"input",
+		"agent",
+		"condition",
+		"confirmation",
+		"output"
+	];
+	/** New workflows start empty, with no scheduled work or business entity. */
+	function createDraft() {
+		return {
+			schemaVersion: 1,
+			enabled: false,
+			graph: {
+				name: "",
+				nodes: [],
+				edges: []
+			},
+			run: idle()
+		};
+	}
+	function idle() {
+		return {
+			status: "idle",
+			cursor: null,
+			value: "",
+			steps: [],
+			error: null,
+			pausedFrom: null
+		};
+	}
+	function requireEditing(draft) {
+		if ([
+			"running",
+			"paused",
+			"waiting"
+		].includes(draft.run.status)) throw new Error("RUN_LOCKED");
+	}
+	/** Add a node only when no mock run is pending. Returns its stable draft-local id. */
+	function addNode(draft, kind, label) {
+		requireEditing(draft);
+		const id = `node-${Math.max(0, ...draft.graph.nodes.map((n) => Number(n.id.slice(5)) || 0)) + 1}`;
+		draft.graph.nodes.push({
+			id,
+			kind,
+			label,
+			value: "",
+			x: 40 + draft.graph.nodes.length % 3 * 235,
+			y: 40 + Math.floor(draft.graph.nodes.length / 3) * 150
+		});
+		draft.run = idle();
+		return id;
+	}
+	/** Connect graph nodes; replacement of the same output port is explicit. */
+	function connect(draft, from, to, branch) {
+		requireEditing(draft);
+		const source = draft.graph.nodes.find((n) => n.id === from);
+		const target = draft.graph.nodes.find((n) => n.id === to);
+		if (!source || !target || from === to || target.kind === "input" || source.kind === "output") throw new Error("INVALID_EDGE");
+		if (source.kind === "condition" !== (branch !== "next")) throw new Error("INVALID_PORT");
+		const edges = [...draft.graph.edges.filter((e) => !(e.from === from && e.branch === branch)), {
+			from,
+			to,
+			branch
+		}];
+		if (hasCycle(draft.graph.nodes, edges)) throw new Error("CYCLE");
+		draft.graph.edges = edges;
+		draft.run = idle();
+	}
+	/** Edit local node properties and invalidate previous completed results. */
+	function updateNode(draft, id, changes) {
+		requireEditing(draft);
+		const node = draft.graph.nodes.find((n) => n.id === id);
+		if (!node || !Number.isFinite(changes.x) || !Number.isFinite(changes.y)) throw new Error("INVALID_GRAPH");
+		Object.assign(node, changes);
+		draft.run = idle();
+	}
+	/** Remove a node and its incident edges without touching other drafts. */
+	function removeNode(draft, id) {
+		requireEditing(draft);
+		draft.graph.nodes = draft.graph.nodes.filter((n) => n.id !== id);
+		draft.graph.edges = draft.graph.edges.filter((e) => e.from !== id && e.to !== id);
+		draft.run = idle();
+	}
+	/** Remove one edge; pending runs are immutable. */
+	function disconnect(draft, edge) {
+		requireEditing(draft);
+		draft.graph.edges = draft.graph.edges.filter((e) => e !== edge);
+		draft.run = idle();
+	}
+	function hasCycle(nodes, edges) {
+		const visiting = /* @__PURE__ */ new Set();
+		const visited = /* @__PURE__ */ new Set();
+		const visit = (id) => {
+			if (visiting.has(id)) return true;
+			if (visited.has(id)) return false;
+			visiting.add(id);
+			for (const edge of edges.filter((e) => e.from === id)) if (visit(edge.to)) return true;
+			visiting.delete(id);
+			visited.add(id);
+			return false;
+		};
+		return nodes.some((n) => visit(n.id));
+	}
+	/** Validate before execution; both condition outputs must be wired and every node reachable. */
+	function validateGraph(graph) {
+		const inputs = graph.nodes.filter((n) => n.kind === "input");
+		if (!graph.name.trim() || inputs.length !== 1 || !graph.nodes.some((n) => n.kind === "output")) throw new Error("GRAPH_INCOMPLETE");
+		const ids = new Set(graph.nodes.map((n) => n.id));
+		if (ids.size !== graph.nodes.length || graph.nodes.some((n) => !nodeKinds.includes(n.kind))) throw new Error("INVALID_GRAPH");
+		const ports = /* @__PURE__ */ new Set();
+		for (const edge of graph.edges) {
+			const source = graph.nodes.find((n) => n.id === edge.from);
+			const target = graph.nodes.find((n) => n.id === edge.to);
+			if (!source || !target || source.kind === "output" || target.kind === "input" || ![
+				"next",
+				"true",
+				"false"
+			].includes(edge.branch) || source.kind === "condition" !== (edge.branch !== "next") || ports.has(`${edge.from}:${edge.branch}`)) throw new Error("INVALID_EDGE");
+			ports.add(`${edge.from}:${edge.branch}`);
+		}
+		if (hasCycle(graph.nodes, graph.edges)) throw new Error("CYCLE");
+		for (const node of graph.nodes) if ((node.kind === "output" ? [] : node.kind === "condition" ? ["true", "false"] : ["next"]).some((branch) => !graph.edges.some((e) => e.from === node.id && e.branch === branch))) throw new Error("GRAPH_INCOMPLETE");
+		const seen = /* @__PURE__ */ new Set();
+		const walk = (id) => {
+			if (seen.has(id)) return;
+			seen.add(id);
+			graph.edges.filter((e) => e.from === id).forEach((e) => walk(e.to));
+		};
+		walk(inputs[0].id);
+		if (seen.size !== ids.size) throw new Error("UNREACHABLE_NODE");
+	}
+	/** Disabling freezes a pending run; enabling never automatically resumes it. */
+	function setEnabled(draft, enabled) {
+		if (!enabled && ["running", "waiting"].includes(draft.run.status)) pause(draft);
+		draft.enabled = enabled;
+	}
+	/** Start a new mock execution without creating a DSH Request, Run, Attempt, or Session. */
+	function start(draft) {
+		if (!draft.enabled) throw new Error("PLUGIN_DISABLED");
+		requireEditing(draft);
+		validateGraph(draft.graph);
+		draft.run = {
+			...idle(),
+			status: "running",
+			cursor: draft.graph.nodes.find((n) => n.kind === "input").id
+		};
+	}
+	/** Pause without changing the cursor, graph, values, or approval state. */
+	function pause(draft) {
+		if (!["running", "waiting"].includes(draft.run.status)) throw new Error("INVALID_STATE");
+		draft.run.pausedFrom = draft.run.status;
+		draft.run.status = "paused";
+	}
+	/** Resume returns an approval wait to waiting, never silently approves it. */
+	function resume(draft) {
+		if (!draft.enabled) throw new Error("PLUGIN_DISABLED");
+		if (draft.run.status !== "paused" || !draft.run.pausedFrom) throw new Error("INVALID_STATE");
+		draft.run.status = draft.run.pausedFrom;
+		draft.run.pausedFrom = null;
+	}
+	function advance(draft, node, branch) {
+		draft.run.steps.push({
+			nodeId: node.id,
+			value: draft.run.value
+		});
+		if (node.kind === "output") {
+			draft.run.status = "completed";
+			draft.run.cursor = null;
+			return;
+		}
+		const edge = draft.graph.edges.find((e) => e.from === node.id && e.branch === branch);
+		if (!edge) throw new Error("MISSING_EDGE");
+		draft.run.cursor = edge.to;
+	}
+	/** Execute exactly one mock node; approval nodes require a separate explicit simulated decision. */
+	function step(draft, runtime = adapter) {
+		if (!draft.enabled) throw new Error("PLUGIN_DISABLED");
+		if (draft.run.status !== "running") throw new Error("INVALID_STATE");
+		const node = draft.graph.nodes.find((n) => n.id === draft.run.cursor);
+		try {
+			if (!node) throw new Error("MISSING_NODE");
+			if (node.kind === "confirmation") {
+				draft.run.status = "waiting";
+				return;
+			}
+			if (node.kind === "input") draft.run.value = node.value;
+			if (node.kind === "agent") {
+				if (runtime.mode !== "mock") throw new Error("MOCK_ONLY");
+				draft.run.value = runtime.invoke(draft.run.value, node.value);
+			}
+			advance(draft, node, node.kind === "condition" ? draft.run.value.includes(node.value) ? "true" : "false" : "next");
+		} catch (error) {
+			draft.run.status = "failed";
+			draft.run.error = error instanceof Error ? error.message : "MOCK_FAILED";
+		}
+	}
+	/** Simulated approval never crosses a Host or provider boundary. */
+	function confirmMock(draft, accepted) {
+		if (!draft.enabled || draft.run.status !== "waiting") throw new Error("INVALID_STATE");
+		const node = draft.graph.nodes.find((n) => n.id === draft.run.cursor);
+		if (!node || node.kind !== "confirmation") throw new Error("MISSING_NODE");
+		if (!accepted) {
+			draft.run.status = "failed";
+			draft.run.error = "MOCK_REJECTED";
+			return;
+		}
+		advance(draft, node, "next");
+		draft.run.status = "running";
+	}
+	/** Serialize a browser-local draft/checkpoint. No DSH persistence or filesystem access. */
+	function saveDraft(storage, draft) {
+		storage.setItem(DRAFT_KEY, JSON.stringify(draft));
+	}
+	/** Parse imported browser data; invalid versions and fields fail visibly, never partially load. */
+	function parseDraft(text) {
+		if (text.length > 1e6) throw new Error("DRAFT_TOO_LARGE");
+		const data = JSON.parse(text);
+		if (data?.schemaVersion !== 1 || typeof data.enabled !== "boolean" || typeof data.graph?.name !== "string" || !Array.isArray(data.graph.nodes) || !Array.isArray(data.graph.edges) || !data.run) throw new Error("INVALID_DRAFT");
+		if (data.graph.nodes.length > 100 || data.graph.edges.length > 200) throw new Error("DRAFT_TOO_LARGE");
+		for (const node of data.graph.nodes) if (typeof node.id !== "string" || !nodeKinds.includes(node.kind) || typeof node.label !== "string" || typeof node.value !== "string" || !Number.isFinite(node.x) || !Number.isFinite(node.y)) throw new Error("INVALID_DRAFT");
+		const ids = new Set(data.graph.nodes.map((n) => n.id));
+		if (ids.size !== data.graph.nodes.length) throw new Error("INVALID_DRAFT");
+		for (const edge of data.graph.edges) if (!ids.has(edge.from) || !ids.has(edge.to) || ![
+			"next",
+			"true",
+			"false"
+		].includes(edge.branch)) throw new Error("INVALID_DRAFT");
+		const run = data.run;
+		if (![
+			"idle",
+			"running",
+			"paused",
+			"waiting",
+			"completed",
+			"failed"
+		].includes(run.status) || typeof run.value !== "string" || !Array.isArray(run.steps) || ![
+			null,
+			"running",
+			"waiting"
+		].includes(run.pausedFrom) || run.error !== null && typeof run.error !== "string" || run.cursor !== null && !ids.has(run.cursor)) throw new Error("INVALID_DRAFT");
+		for (const entry of run.steps) if (!entry || !ids.has(entry.nodeId) || typeof entry.value !== "string") throw new Error("INVALID_DRAFT");
+		if (run.status === "paused" !== (run.pausedFrom !== null)) throw new Error("INVALID_DRAFT");
+		if ([
+			"running",
+			"waiting",
+			"paused"
+		].includes(run.status)) {
+			validateGraph(data.graph);
+			if (!run.cursor) throw new Error("INVALID_DRAFT");
+		}
+		return data;
+	}
+	/** Reopen only this plugin's namespaced browser-local checkpoint. */
+	function reopen(storage) {
+		const text = storage.getItem(DRAFT_KEY);
+		if (text === null) throw new Error("NO_SAVED_DRAFT");
+		return parseDraft(text);
+	}
+	//#endregion
+	//#region src/view.ts
+	/** Task workflow canvas shared by the isolated HTML and the Workbench browser plugin. */
+	const dictionaries = {
+		zh: {
+			title: "任务工作流",
+			note: "Workbench v0.2-dev · DSH plugin v0.1 · Mock / 本地草稿",
+			safety: "仅任务工作流；不连接 Bot、Session、Provider 或 Agent。保存仅写此浏览器草稿。",
+			enable: "启用插件",
+			disable: "停用插件",
+			fresh: "创建工作流",
+			name: "工作流名称",
+			save: "保存草稿",
+			open: "重新打开",
+			add: "添加节点",
+			input: "输入",
+			agent: "Agent / 模型占位",
+			condition: "条件（包含文本）",
+			confirmation: "人工确认",
+			output: "输出",
+			connect: "连线",
+			from: "源节点",
+			to: "目标节点",
+			next: "下一步",
+			true: "成立",
+			false: "不成立",
+			run: "Mock 执行",
+			step: "执行下一节点",
+			pause: "暂停",
+			resume: "恢复",
+			accept: "模拟同意",
+			reject: "模拟拒绝",
+			idle: "未运行",
+			running: "运行中",
+			paused: "已暂停",
+			waiting: "等待人工确认",
+			completed: "已完成",
+			failed: "失败",
+			empty: "画布为空：添加输入节点开始，或载入示例",
+			sample: "载入示例",
+			node: "节点",
+			label: "名称",
+			value: "输入值 / 模拟指令 / 条件文本",
+			position: "位置 X / Y",
+			update: "更新节点",
+			remove: "移除节点",
+			disconnect: "断开连线",
+			result: "运行结果",
+			local: "本地保存成功",
+			enabled: "插件已启用",
+			disabled: "插件已停用",
+			receipt: "Preview receipt：wouldWrite=true · executed=false · redacted=true",
+			preview: "任务草稿与模拟运行；真实操作不可用",
+			real: "真实执行（不可用）",
+			error: "操作未完成，数据已保留",
+			errors: {
+				RUN_LOCKED: "运行期间请先完成模拟；可随时保存当前状态",
+				INVALID_EDGE: "请选择两个有效且不同的节点",
+				INVALID_PORT: "条件节点需选择成立或不成立，其余节点选择下一步",
+				CYCLE: "不支持循环连线",
+				GRAPH_INCOMPLETE: "填写名称并连接一个输入、输出及各节点出口",
+				UNREACHABLE_NODE: "有节点无法从输入到达",
+				PLUGIN_DISABLED: "先启用插件",
+				INVALID_STATE: "当前状态不能执行该操作",
+				NO_SAVED_DRAFT: "尚无已保存草稿",
+				INVALID_DRAFT: "草稿格式无效",
+				MOCK_REJECTED: "模拟人工确认已拒绝",
+				MISSING_EDGE: "节点缺少出口",
+				MOCK_FAILED: "模拟执行失败"
+			}
+		},
+		en: {
+			title: "Task workflows",
+			note: "Workbench v0.2-dev · DSH plugin v0.1 · Mock / local draft",
+			safety: "Task workflows only; no Bot, Session, Provider or Agent connection. Save writes only this browser draft.",
+			enable: "Enable plugin",
+			disable: "Disable plugin",
+			fresh: "Create workflow",
+			name: "Workflow name",
+			save: "Save draft",
+			open: "Reopen",
+			add: "Add node",
+			input: "Input",
+			agent: "Agent / model placeholder",
+			condition: "Condition (contains text)",
+			confirmation: "Human confirmation",
+			output: "Output",
+			connect: "Connect",
+			from: "Source node",
+			to: "Target node",
+			next: "Next",
+			true: "True",
+			false: "False",
+			run: "Mock execute",
+			step: "Execute next node",
+			pause: "Pause",
+			resume: "Resume",
+			accept: "Simulate accept",
+			reject: "Simulate reject",
+			idle: "Not started",
+			running: "Running",
+			paused: "Paused",
+			waiting: "Waiting for confirmation",
+			completed: "Completed",
+			failed: "Failed",
+			empty: "Empty canvas: add an input or load the example",
+			sample: "Load example",
+			node: "Node",
+			label: "Name",
+			value: "Input value / mock instruction / condition text",
+			position: "Position X / Y",
+			update: "Update node",
+			remove: "Remove node",
+			disconnect: "Disconnect",
+			result: "Run result",
+			local: "Local draft saved",
+			enabled: "Plugin enabled",
+			disabled: "Plugin disabled",
+			receipt: "Preview receipt: wouldWrite=true · executed=false · redacted=true",
+			preview: "Task draft and mock run; real actions unavailable",
+			real: "Real execution (unavailable)",
+			error: "Action failed; current data retained",
+			errors: {
+				RUN_LOCKED: "Finish the pending mock run before editing; save is always available",
+				INVALID_EDGE: "Select two valid different nodes",
+				INVALID_PORT: "Use true/false for conditions and next for other nodes",
+				CYCLE: "Cycles are not supported",
+				GRAPH_INCOMPLETE: "Name the workflow and connect one input, output, and every output port",
+				UNREACHABLE_NODE: "A node is unreachable from the input",
+				PLUGIN_DISABLED: "Enable the plugin first",
+				INVALID_STATE: "Action is unavailable in this state",
+				NO_SAVED_DRAFT: "No saved draft",
+				INVALID_DRAFT: "Invalid draft format",
+				MOCK_REJECTED: "Simulated approval rejected",
+				MISSING_EDGE: "Missing node output",
+				MOCK_FAILED: "Mock execution failed"
+			}
+		}
+	};
+	const workflowCss = `
+.tw{font:13px/1.5 system-ui,sans-serif;color:var(--dsw-alias-text-primary,#202329);background:var(--dsw-alias-bg-layer-1,#fafafa);padding:24px;min-height:100%;box-sizing:border-box;letter-spacing:normal}.tw *{box-sizing:border-box}.tw h1{font-size:24px;font-weight:500;margin:0}.tw h2{font-size:16px;font-weight:500}.tw p{margin:8px 0}.tw header,.tw .toolbar,.tw .links{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.tw header{justify-content:space-between}.tw button,.tw input,.tw select{font:inherit;color:inherit;border:1px solid var(--dsw-alias-border-primary,#999);border-radius:8px;background:var(--dsw-alias-bg-layer-2,#fff);padding:7px 10px;max-width:100%}.tw button{cursor:pointer}.tw button:disabled{cursor:default;opacity:.5}.tw :focus-visible{outline:2px solid #3678cf;outline-offset:2px}.tw .layout{display:grid;grid-template-columns:minmax(0,1fr) 270px;gap:16px}.tw .scroll{overflow:auto;min-width:0;border:1px solid var(--dsw-alias-border-primary,#aaa);border-radius:12px}.tw .canvas{position:relative;width:900px;min-height:560px;background:var(--dsw-alias-bg-layer-2,#fff)}.tw svg{position:absolute;inset:0;pointer-events:none}.tw line{stroke:var(--dsw-alias-text-primary,#333);stroke-width:2}.tw .node{position:absolute;width:200px;min-height:90px;text-align:left;overflow-wrap:anywhere;white-space:normal}.tw .node[aria-pressed=true]{outline:2px solid #3678cf}.tw .kind{display:block;font-size:12px}.tw .editor{min-width:0}.tw label{display:block;margin-bottom:10px}.tw label input,.tw label select{display:block;width:100%}.tw .status{padding:5px 10px;border:1px solid currentColor;border-radius:8px;overflow-wrap:anywhere}.tw .notice{min-height:30px;overflow-wrap:anywhere}.tw .receipt,.tw pre{white-space:pre-wrap;overflow-wrap:anywhere;max-width:100%;margin:12px 0}.tw .edge{display:flex;gap:8px;align-items:center;margin:5px 0;overflow-wrap:anywhere}.tw .empty{padding:30px}.tw .run-list{padding-left:20px;overflow-wrap:anywhere}.tw .muted{color:var(--dsw-alias-text-secondary,#555)}
+[data-ds-dark-theme] .tw,.tw[data-theme=dark]{color:var(--dsw-alias-text-primary,#ededed);background:var(--dsw-alias-bg-layer-1,#181a1f)}[data-ds-dark-theme] .tw .canvas,[data-ds-dark-theme] .tw button,[data-ds-dark-theme] .tw input,[data-ds-dark-theme] .tw select,.tw[data-theme=dark] .canvas,.tw[data-theme=dark] button,.tw[data-theme=dark] input,.tw[data-theme=dark] select{background:var(--dsw-alias-bg-layer-2,#24272e)}[data-ds-dark-theme] .tw .muted,.tw[data-theme=dark] .muted{color:var(--dsw-alias-text-secondary,#bfc4ce)}[data-ds-dark-theme] .tw line,.tw[data-theme=dark] line{stroke:var(--dsw-alias-text-primary,#ededed)}@media(max-width:760px){.tw{padding:12px}.tw .layout{grid-template-columns:minmax(0,1fr)}.tw .editor{order:-1}.tw h1{font-size:20px}}
+`;
+	/** Mount a self-contained local draft editor; returned cleanup removes all listeners. */
+	function mountWorkflow(root, storage, locale = "zh", theme = "light") {
+		const t = dictionaries[locale.startsWith("zh") ? "zh" : "en"];
+		let draft = createDraft();
+		let selected = "";
+		let notice = "";
+		let disposed = false;
+		const doc = root.ownerDocument;
+		const initial = doc.createElement("style");
+		initial.textContent = workflowCss;
+		function el(tag, text = "") {
+			const e = doc.createElement(tag);
+			e.textContent = text;
+			return e;
+		}
+		const busy = () => [
+			"running",
+			"paused",
+			"waiting"
+		].includes(draft.run.status);
+		function errorText(code) {
+			return t.errors[code] ?? code;
+		}
+		function action(fn) {
+			try {
+				notice = "";
+				fn();
+			} catch (error) {
+				notice = `${t.error}: ${errorText(error instanceof Error ? error.message : "MOCK_FAILED")}`;
+			}
+			render();
+		}
+		function button(text, fn, disabled = false, id = "") {
+			const b = el("button", text);
+			b.type = "button";
+			b.disabled = disabled;
+			b.dataset.action = id;
+			b.addEventListener("click", () => action(fn));
+			return b;
+		}
+		function label(text, input) {
+			const l = el("label", text);
+			l.append(input);
+			return l;
+		}
+		function input(value) {
+			const e = el("input");
+			e.value = value;
+			return e;
+		}
+		function options(values, labels) {
+			const e = el("select");
+			for (const value of values) {
+				const opt = el("option", labels(value));
+				opt.value = value;
+				e.append(opt);
+			}
+			return e;
+		}
+		function sample() {
+			if (busy()) throw new Error("RUN_LOCKED");
+			draft = createDraft();
+			draft.graph.name = t.title;
+			const a = addNode(draft, "input", t.input);
+			const b = addNode(draft, "agent", t.agent);
+			const c = addNode(draft, "condition", t.condition);
+			const d = addNode(draft, "confirmation", t.confirmation);
+			const e = addNode(draft, "output", t.output);
+			draft.graph.nodes[0].value = "sample";
+			draft.graph.nodes[1].value = "mock";
+			draft.graph.nodes[2].value = "sample";
+			connect(draft, a, b, "next");
+			connect(draft, b, c, "next");
+			connect(draft, c, d, "true");
+			connect(draft, c, e, "false");
+			connect(draft, d, e, "next");
+			selected = a;
+		}
+		function render() {
+			if (disposed) return;
+			const page = el("main");
+			page.className = "tw";
+			page.dataset.theme = theme;
+			const header = el("header");
+			header.append(el("h1", t.title), el("span", draft.enabled ? t.enabled : t.disabled));
+			page.append(header, el("p", t.note), el("p", t.safety));
+			const toolbar = el("div");
+			toolbar.className = "toolbar";
+			const name = input(draft.graph.name);
+			name.disabled = busy();
+			name.setAttribute("aria-label", t.name);
+			name.placeholder = t.name;
+			name.oninput = () => {
+				draft.graph.name = name.value;
+			};
+			toolbar.append(name, button(t.fresh, () => {
+				if (busy()) throw new Error("RUN_LOCKED");
+				draft = createDraft();
+				selected = "";
+			}, busy(), "new"), button(t.sample, sample, busy(), "sample"), button(draft.enabled ? t.disable : t.enable, () => setEnabled(draft, !draft.enabled), false, "enable"), button(t.save, () => {
+				saveDraft(storage, draft);
+				notice = t.local;
+			}, false, "save"), button(t.open, () => {
+				draft = reopen(storage);
+				selected = "";
+			}, busy(), "open"));
+			page.append(toolbar);
+			const controls = el("div");
+			controls.className = "toolbar";
+			const kind = options(nodeKinds, (s) => t[s]);
+			kind.setAttribute("aria-label", t.add);
+			kind.disabled = busy();
+			controls.append(kind, button(t.add, () => {
+				selected = addNode(draft, kind.value, t[kind.value]);
+			}, busy(), "add"));
+			const ids = draft.graph.nodes.map((n) => n.id);
+			const text = (id) => draft.graph.nodes.find((n) => n.id === id)?.label ?? id;
+			const from = options(ids, text);
+			from.setAttribute("aria-label", t.from);
+			const to = options(ids, text);
+			to.setAttribute("aria-label", t.to);
+			const branch = options([
+				"next",
+				"true",
+				"false"
+			], (s) => t[s]);
+			branch.setAttribute("aria-label", t.connect);
+			controls.append(from, branch, to, button(t.connect, () => connect(draft, from.value, to.value, branch.value), busy() || ids.length < 2, "connect"));
+			page.append(controls);
+			const feedback = el("div", notice);
+			feedback.className = "notice";
+			feedback.setAttribute("role", "status");
+			page.append(feedback);
+			const layout = el("div");
+			layout.className = "layout";
+			const scroll = el("div");
+			scroll.className = "scroll";
+			scroll.tabIndex = 0;
+			scroll.setAttribute("aria-label", t.title);
+			const canvas = el("div");
+			canvas.className = "canvas";
+			const canvasHeight = Math.max(560, ...draft.graph.nodes.map((n) => n.y + 130));
+			canvas.style.minHeight = `${canvasHeight}px`;
+			const svg = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
+			svg.setAttribute("width", "900");
+			svg.setAttribute("height", String(canvasHeight));
+			svg.setAttribute("aria-hidden", "true");
+			for (const edge of draft.graph.edges) {
+				const a = draft.graph.nodes.find((n) => n.id === edge.from);
+				const b = draft.graph.nodes.find((n) => n.id === edge.to);
+				if (!a || !b) continue;
+				const line = doc.createElementNS("http://www.w3.org/2000/svg", "line");
+				for (const [key, value] of Object.entries({
+					x1: a.x + 100,
+					y1: a.y + 45,
+					x2: b.x + 100,
+					y2: b.y + 45
+				})) line.setAttribute(key, String(value));
+				svg.append(line);
+			}
+			canvas.append(svg);
+			if (!ids.length) {
+				const empty = el("p", t.empty);
+				empty.className = "empty";
+				canvas.append(empty);
+			}
+			for (const node of draft.graph.nodes) {
+				const b = button(node.label, () => {
+					selected = node.id;
+				}, false);
+				b.className = "node";
+				b.style.left = `${node.x}px`;
+				b.style.top = `${node.y}px`;
+				b.setAttribute("aria-pressed", String(node.id === selected));
+				b.dataset.nodeId = node.id;
+				const kind = el("span", t[node.kind]);
+				kind.className = "kind";
+				b.append(kind, el("span", node.id === draft.run.cursor ? t[draft.run.status] : node.value));
+				canvas.append(b);
+			}
+			scroll.append(canvas);
+			layout.append(scroll);
+			const editor = el("aside");
+			editor.className = "editor";
+			editor.append(el("h2", t.node));
+			const node = draft.graph.nodes.find((n) => n.id === selected);
+			if (node) {
+				const name = input(node.label);
+				const value = input(node.value);
+				const x = input(String(node.x));
+				const y = input(String(node.y));
+				x.type = y.type = "number";
+				x.min = y.min = "0";
+				x.max = "690";
+				y.max = "450";
+				for (const i of [
+					name,
+					value,
+					x,
+					y
+				]) i.disabled = busy();
+				editor.append(label(t.label, name), label(t.value, value), label(`${t.position} X`, x), label(`${t.position} Y`, y), button(t.update, () => {
+					updateNode(draft, node.id, {
+						label: name.value,
+						value: value.value,
+						x: Math.max(0, Math.min(690, Number(x.value) || 0)),
+						y: Math.max(0, Math.min(450, Number(y.value) || 0))
+					});
+				}, busy(), "update"), button(t.remove, () => {
+					removeNode(draft, selected);
+					selected = "";
+				}, busy(), "remove"));
+			}
+			for (const edge of draft.graph.edges) {
+				const row = el("div", `${text(edge.from)} → ${t[edge.branch]} → ${text(edge.to)}`);
+				row.className = "edge";
+				row.append(button(t.disconnect, () => {
+					disconnect(draft, edge);
+				}, busy()));
+				editor.append(row);
+			}
+			layout.append(editor);
+			page.append(layout);
+			const runbar = el("div");
+			runbar.className = "toolbar";
+			const status = el("span", t[draft.run.status]);
+			status.className = "status";
+			status.dataset.status = draft.run.status;
+			runbar.append(status, button(t.run, () => start(draft), !draft.enabled || busy(), "run"), button(t.step, () => step(draft), !draft.enabled || draft.run.status !== "running", "step"), button(t.pause, () => pause(draft), !["running", "waiting"].includes(draft.run.status), "pause"), button(t.resume, () => resume(draft), !draft.enabled || draft.run.status !== "paused", "resume"), button(t.accept, () => confirmMock(draft, true), !draft.enabled || draft.run.status !== "waiting", "accept"), button(t.reject, () => confirmMock(draft, false), !draft.enabled || draft.run.status !== "waiting", "reject"), button(t.real, () => {}, true, "real"));
+			page.append(el("h2", t.result), runbar);
+			if (draft.run.error) {
+				const error = el("p", errorText(draft.run.error));
+				error.setAttribute("role", "alert");
+				page.append(error);
+			}
+			const result = el("pre", draft.run.value);
+			result.dataset.result = "mock";
+			page.append(result);
+			const steps = el("ol");
+			steps.className = "run-list";
+			for (const entry of draft.run.steps) steps.append(el("li", `${text(entry.nodeId)}: ${entry.value}`));
+			page.append(steps);
+			const receipt = el("p", t.receipt);
+			receipt.className = "receipt";
+			page.append(receipt, el("p", t.preview));
+			root.replaceChildren(initial, page);
+		}
+		render();
+		return () => {
+			disposed = true;
+			root.replaceChildren();
+		};
+	}
+	//#endregion
+	//#region src/preview.ts
+	/** Standalone local preview using the same production editor; no HTTP server required. */
+	const root = document.querySelector("#app");
+	const locale = document.querySelector("#preview-locale");
+	const theme = document.querySelector("#preview-theme");
+	const storage = {
+		getItem: (key) => localStorage.getItem(key),
+		setItem: (key, value) => localStorage.setItem(key, value)
+	};
+	let dispose = mountWorkflow(root, storage, locale.value, theme.value);
+	const update = () => {
+		dispose();
+		dispose = mountWorkflow(root, storage, locale.value, theme.value);
+	};
+	locale.addEventListener("change", update);
+	theme.addEventListener("change", update);
+	//#endregion
+})();
+</script></body></html>

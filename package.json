@@ -1,0 +1,60 @@
+{
+  "name": "@deepseek-ai/dsh-task-workflow",
+  "version": "0.2.2-rc.3",
+  "description": "Workbench task workflow canvas with browser-local drafts and a mock-only runtime",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "lib/client.js",
+    "lib/preview.js",
+    "lib/model.mjs",
+    "lib/view.mjs",
+    "preview-zh.html",
+    "preview-en.html",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "lint": "oxlint src scripts tests",
+    "check": "npm run build && npm run typecheck && npm run lint && npm test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nico-zhuang/dsh-task-workflow.git"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "tsdown": "0.22.2",
+    "tsx": "4.23.13",
+    "jsdom": "29.1.1",
+    "js-yaml": "4.3.2",
+    "oxlint": "1.81.0"
+  }
+}

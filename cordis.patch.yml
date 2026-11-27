@@ -1,0 +1,3 @@
+- insert:
+    - id: task-workflow
+      name: '@deepseek-ai/dsh-task-workflow'
